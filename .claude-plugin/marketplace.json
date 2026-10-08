@@ -1,0 +1,23 @@
+{
+  "name": "tmux-recording",
+  "description": "Terminal recording to narrated video: record in tmux, narrate, voice with VoiceStudio, assemble.",
+  "owner": {
+    "name": "Daniel Granatshtein"
+  },
+  "metadata": {
+    "version": "0.1.1"
+  },
+  "plugins": [
+    {
+      "name": "terminal-video",
+      "source": "./",
+      "description": "Record a terminal run in tmux, narrate it from what the screen showed, voice it with VoiceStudio, and assemble the narrated video.",
+      "version": "0.1.1",
+      "author": {
+        "name": "Daniel Granatshtein"
+      },
+      "category": "productivity",
+      "keywords": ["tmux", "asciinema", "terminal", "screen-recording", "narration", "text-to-speech", "voicestudio", "video", "demo"]
+    }
+  ]
+}

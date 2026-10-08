@@ -1,0 +1,894 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["pyte>=0.8.2"]
+# ///
+"""tvid: record a terminal session in tmux, read it back as text, voice a narration, assemble the video.
+
+Every subcommand takes a working directory (DIR) that holds the recording and everything derived
+from it, so the stages hand files to each other by name:
+
+  DIR/recording.cast      asciinema recording (source of truth for time and screen text)
+  DIR/recording.mp4       the cast rendered at real speed
+  DIR/readout.txt         what the screen showed, and when
+  DIR/narration.json      the lines to speak, each anchored to a source-video time
+  DIR/voice/              one WAV per line, plus clips.json with measured durations
+  DIR/final/              narrated video, narration track, subtitles, report
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import difflib
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import uuid
+import wave
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ── shared ────────────────────────────────────────────────────────────────────────────────────────
+
+PROMPT_LINE = re.compile(r"^\$(\s|$)")
+MARK = re.compile(r"\x1b\]7777;tvid;(\w+);([^\x07\x1b]*)(?:\x07|\x1b\\)")
+SPINNER = re.compile(r"[⠀-⣿◐◓◑◒◴◷◶◵]")  # braille and circle spinner frames
+
+
+def die(msg: str) -> None:
+    print(f"tvid: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=True, text=True, capture_output=True, **kw)
+
+
+def need(*tools: str) -> None:
+    missing = [t for t in tools if not shutil.which(t)]
+    if missing:
+        die(f"missing tools: {', '.join(missing)} (brew install {' '.join(missing)})")
+
+
+def pause(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def fmt_t(t: float) -> str:
+    m, s = divmod(max(t, 0.0), 60)
+    return f"{int(m)}:{s:05.2f}"
+
+
+def probe_duration(path: Path) -> float:
+    out = run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)])
+    return float(out.stdout.strip())
+
+
+def probe_fps(path: Path) -> float:
+    out = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+               "stream=r_frame_rate", "-of", "csv=p=0", str(path)]).stdout.strip()
+    num, _, den = out.partition("/")
+    return float(num) / float(den or 1)
+
+
+# ── rec: a zsh in tmux, recorded by asciinema, driven by the agent ──────────────────────────────────
+#
+# The pane runs `asciinema rec -c "zsh -il"`. The shell loads the user's own startup files (PATH, tool
+# managers), then a plain prompt and two hooks: preexec writes an invisible OSC marker with the
+# command, precmd writes one with the exit code and bumps a counter in DIR/.tvid/state. `run` types a
+# command and polls that counter, so it knows exactly when the prompt is back.
+
+ZSHENV = """\
+ZDOTDIR=$HOME
+[[ -n $TVID_USER_RC && -f $HOME/.zshenv ]] && source $HOME/.zshenv
+ZDOTDIR=$TVID_RC
+"""
+ZPROFILE = """\
+ZDOTDIR=$HOME
+[[ -n $TVID_USER_RC && -f $HOME/.zprofile ]] && source $HOME/.zprofile
+ZDOTDIR=$TVID_RC
+"""
+ZSHRC = r"""
+ZDOTDIR=$HOME
+[[ -n $TVID_USER_RC && -f $HOME/.zshrc ]] && source $HOME/.zshrc >/dev/null 2>&1
+ZDOTDIR=$TVID_RC
+unset HISTFILE RPROMPT RPS1
+setopt interactivecomments
+precmd_functions=() preexec_functions=()
+PROMPT='%F{green}$%f '
+typeset -gi _tvid_n=0
+_tvid_preexec() {
+  printf '\e]7777;tvid;cmd;%s\a' "$(print -rn -- "$1" | base64 | tr -d '\n')"
+  print -r -- "running $_tvid_n" >| $TVID_STATE
+}
+_tvid_precmd() {
+  local s=$?
+  (( _tvid_n++ ))
+  printf '\e]7777;tvid;prompt;%d\a' $s
+  print -r -- "idle $_tvid_n $s" >| $TVID_STATE
+}
+# Comment-only lines (captions) never reach preexec; zshaddhistory sees every line.
+_tvid_addhistory() {
+  [[ $1 == '#'* ]] && printf '\e]7777;tvid;cmd;%s\a' "$(print -rn -- "${1%$'\n'}" | base64 | tr -d '\n')"
+  return 0
+}
+preexec_functions=(_tvid_preexec)
+precmd_functions=(_tvid_precmd)
+zshaddhistory_functions=(_tvid_addhistory)
+clear
+"""
+
+
+def session(d: Path) -> dict:
+    f = d / ".tvid" / "session.json"
+    if not f.exists():
+        die(f"no recording session in {d} (run: tvid rec start {d})")
+    return json.loads(f.read_text())
+
+
+def alive(name: str) -> bool:
+    return subprocess.run(["tmux", "has-session", "-t", f"={name}"], capture_output=True).returncode == 0
+
+
+def state(d: Path) -> tuple[str, int, int | None]:
+    try:
+        parts = (d / ".tvid" / "state").read_text().split()
+    except FileNotFoundError:
+        return ("starting", -1, None)
+    if parts[0] == "idle":
+        return ("idle", int(parts[1]), int(parts[2]))
+    return ("running", int(parts[1]), None)
+
+
+def wait_prompt(d: Path, after: int, timeout: float) -> int:
+    """Waits until the shell has shown a prompt numbered above `after`; returns that prompt's exit code."""
+    s = session(d)
+    end = time.time() + timeout
+    while time.time() < end:
+        st, n, code = state(d)
+        if st == "idle" and n > after:
+            return code
+        if not alive(s["tmux"]):
+            die("the recording session ended")
+        pause(0.2)
+    die(f"still running after {timeout:.0f}s; continue with: tvid rec wait {d} --timeout N")
+
+
+def type_keys(name: str, text: str, delay: float) -> None:
+    def send(chunk: str) -> None:
+        # tmux reads an argument ending in ';' as a command separator unless it is escaped.
+        run(["tmux", "send-keys", "-t", name, "-l", "--", chunk[:-1] + "\\;" if chunk.endswith(";") else chunk])
+    if delay <= 0:
+        send(text)
+        return
+    for ch in text:
+        send(ch)
+        pause(delay)
+
+
+def screen_text(name: str) -> str:
+    return run(["tmux", "capture-pane", "-p", "-t", name]).stdout.rstrip()
+
+
+def tail(name: str, n: int = 15) -> str:
+    lines = [l for l in screen_text(name).splitlines() if l.strip()]
+    return "\n".join(lines[-n:])
+
+
+def rec_start(a) -> None:
+    need("tmux", "asciinema", "zsh")
+    d = Path(a.dir).resolve()
+    if (d / ".tvid" / "session.json").exists() and alive(session(d)["tmux"]):
+        die(f"{d} is already recording (tmux session {session(d)['tmux']})")
+    rc = d / ".tvid" / "zdotdir"
+    rc.mkdir(parents=True, exist_ok=True)
+    (rc / ".zshenv").write_text(ZSHENV)
+    (rc / ".zprofile").write_text(ZPROFILE)
+    (rc / ".zshrc").write_text(ZSHRC)
+    (d / ".tvid" / "state").unlink(missing_ok=True)
+    cast = d / "recording.cast"
+    name = a.name or f"tvid-{d.name}"
+    env = {
+        "ZDOTDIR": str(rc), "TVID_RC": str(rc), "TVID_STATE": str(d / ".tvid" / "state"),
+        "TVID_USER_RC": "" if a.no_user_rc else "1",
+    }
+    rec = f"asciinema rec -q --overwrite -c 'zsh -il' {shlex.quote(str(cast))}"
+    cmd = ["tmux", "new-session", "-d", "-s", name, "-x", str(a.cols), "-y", str(a.rows),
+           "-c", str(Path(a.cwd).resolve() if a.cwd else Path.cwd())]
+    for k, v in env.items():
+        cmd += ["-e", f"{k}={v}"]
+    run(cmd + [rec])
+    run(["tmux", "set-option", "-t", name, "window-size", "manual"])
+    run(["tmux", "set-option", "-t", name, "status", "off"])
+    run(["tmux", "resize-window", "-t", name, "-x", str(a.cols), "-y", str(a.rows)])
+    (d / ".tvid" / "session.json").write_text(json.dumps(
+        {"tmux": name, "cast": str(cast), "cols": a.cols, "rows": a.rows}, indent=2))
+    wait_prompt(d, -1, 60)
+    print(f"recording {cast}\ntmux session {name} ({a.cols}x{a.rows}); watch live with: tmux attach -r -t {name}")
+
+
+def rec_run(a) -> None:
+    d = Path(a.dir).resolve()
+    s = session(d)
+    st, n, _ = state(d)
+    if st != "idle":
+        die("a command is still running; use `tvid rec wait` or `tvid rec send` first")
+    if a.caption:
+        type_keys(s["tmux"], f"# {a.caption}", a.type_delay / 2)
+        run(["tmux", "send-keys", "-t", s["tmux"], "Enter"])
+        wait_prompt(d, n, 10)
+        n = state(d)[1]
+        pause(a.caption_pause)
+    t0 = time.time()
+    type_keys(s["tmux"], a.command, a.type_delay)
+    pause(0.4)
+    run(["tmux", "send-keys", "-t", s["tmux"], "Enter"])
+    if a.no_wait:
+        print("started; next: tvid rec screen / send / wait")
+        return
+    code = wait_prompt(d, n, a.timeout)
+    print(f"exit {code} after {time.time() - t0:.1f}s\n--- screen tail ---\n{tail(s['tmux'])}")
+
+
+def rec_wait(a) -> None:
+    d = Path(a.dir).resolve()
+    st, n, code = state(d)
+    if st == "idle":
+        print(f"idle (last exit {code})")
+        return
+    code = wait_prompt(d, n, a.timeout)
+    print(f"exit {code}\n--- screen tail ---\n{tail(session(d)['tmux'])}")
+
+
+def rec_send(a) -> None:
+    s = session(Path(a.dir).resolve())
+    type_keys(s["tmux"], a.text, a.type_delay)
+    if a.enter:
+        pause(0.3)
+        run(["tmux", "send-keys", "-t", s["tmux"], "Enter"])
+
+
+def rec_key(a) -> None:
+    s = session(Path(a.dir).resolve())
+    run(["tmux", "send-keys", "-t", s["tmux"], *a.keys])
+
+
+def rec_screen(a) -> None:
+    print(screen_text(session(Path(a.dir).resolve())["tmux"]))
+
+
+def rec_pause(a) -> None:
+    pause(a.seconds)
+
+
+def rec_clear(a) -> None:
+    d = Path(a.dir).resolve()
+    _, n, _ = state(d)
+    s = session(d)
+    run(["tmux", "send-keys", "-t", s["tmux"], "-l", "clear"])
+    run(["tmux", "send-keys", "-t", s["tmux"], "Enter"])
+    wait_prompt(d, n, 10)
+
+
+def rec_stop(a) -> None:
+    d = Path(a.dir).resolve()
+    s = session(d)
+    if state(d)[0] != "idle":
+        die("a command is still running; wait for it before stopping")
+    run(["tmux", "send-keys", "-t", s["tmux"], "C-d"])
+    end = time.time() + 15
+    while alive(s["tmux"]) and time.time() < end:
+        pause(0.2)
+    if alive(s["tmux"]):
+        run(["tmux", "send-keys", "-t", s["tmux"], "-l", "exit"])
+        run(["tmux", "send-keys", "-t", s["tmux"], "Enter"])
+        pause(2)
+    if alive(s["tmux"]):
+        die(f"tmux session {s['tmux']} did not exit; inspect with: tmux attach -t {s['tmux']}")
+    cast = Path(s["cast"])
+    events = sum(1 for _ in cast.open()) - 1
+    print(f"saved {cast} ({events} events, {cast_duration(cast):.1f}s)")
+
+
+# ── render ─────────────────────────────────────────────────────────────────────────────────────────
+
+
+def render(a) -> None:
+    need("agg", "ffmpeg")
+    d = Path(a.dir).resolve()
+    cast = Path(a.cast) if a.cast else d / "recording.cast"
+    out = Path(a.out) if a.out else d / "recording.mp4"
+    with tempfile.TemporaryDirectory() as tmp:
+        gif = Path(tmp) / "r.gif"
+        # agg squashes idle time to 5s by default; the narration needs the real clock.
+        run(["agg", "--idle-time-limit", "100000", "--fps-cap", str(a.fps), "--font-size", str(a.font_size),
+             "--theme", a.theme, "--last-frame-duration", "1", str(cast), str(gif)])
+        run(["ffmpeg", "-y", "-v", "error", "-i", str(gif), "-movflags", "+faststart", "-pix_fmt", "yuv420p",
+             "-vf", f"fps={a.fps},scale=trunc(iw/2)*2:trunc(ih/2)*2", "-c:v", "libx264", "-crf", "18", str(out)])
+    print(f"rendered {out} ({probe_duration(out):.1f}s; cast {cast_duration(cast):.1f}s)")
+
+
+# ── readout: the screen as text, over time ──────────────────────────────────────────────────────────
+
+
+def read_cast(path: Path):
+    """Yields (header, [(t, kind, data)]) with absolute times for asciicast v2 and v3."""
+    with path.open() as f:
+        header = json.loads(f.readline())
+        events, t = [], 0.0
+        v3 = header.get("version") == 3
+        for line in f:
+            if not line.strip() or line.startswith("#"):
+                continue
+            ts, kind, data = json.loads(line)
+            t = t + ts if v3 else ts
+            events.append((t, kind, data))
+    if v3:
+        header.setdefault("width", header.get("term", {}).get("cols"))
+        header.setdefault("height", header.get("term", {}).get("rows"))
+    return header, events
+
+
+def cast_duration(path: Path) -> float:
+    _, events = read_cast(path)
+    return events[-1][0] if events else 0.0
+
+
+def readout(a) -> None:
+    import pyte
+
+    d = Path(a.dir).resolve()
+    cast = Path(a.cast) if a.cast else d / "recording.cast"
+    header, events = read_cast(cast)
+    screen = pyte.Screen(header["width"], header["height"])
+    stream = pyte.Stream(screen)
+
+    def lines() -> list[str]:
+        return [l.rstrip() for l in screen.display]
+
+    if a.at is not None:
+        for t, kind, data in events:
+            if t > a.at:
+                break
+            if kind == "o":
+                stream.feed(MARK.sub("", data))
+        print(f"# screen at t={a.at:.2f}s\n" + "\n".join(lines()).rstrip())
+        return
+
+    out: list[str] = []
+    started = header.get("timestamp")
+    start_iso = datetime.fromtimestamp(started, timezone.utc).isoformat() if started else "unknown"
+    out.append(f"# readout of {cast.name}: {header['width']}x{header['height']}, {events[-1][0]:.1f}s, "
+               f"recording started {start_iso} (whole seconds)")
+    out.append("# [t] is seconds into the source video. '+' new line, '~' line rewritten in place,")
+    out.append("# '▸' command typed at the prompt, '✓'/'✗' prompt returned with that exit code.")
+
+    def norm(l: str) -> str:
+        return SPINNER.sub("·", l).strip()
+
+    prev: list[str] = []
+    last_emit, dirty, cmd_t = -1e9, False, None
+    first_seen: dict[str, float] = {}  # normalized line → when it first appeared on screen
+    body_from = len(out)
+
+    def track(t: float) -> None:
+        for r in screen.dirty:
+            first_seen.setdefault(norm(screen.display[r]), t)
+        screen.dirty.clear()
+
+    def emit(t: float) -> None:
+        nonlocal prev, last_emit, dirty
+        cur = lines()
+        sm = difflib.SequenceMatcher(a=[norm(l) for l in prev], b=[norm(l) for l in cur], autojunk=False)
+        for op, i1, i2, j1, j2 in sm.get_opcodes():
+            if op not in ("insert", "replace"):
+                continue
+            for k, l in enumerate(cur[j1:j2]):
+                # Prompt lines are reported as ▸ commands from the shell's own markers.
+                if l.strip() and not PROMPT_LINE.match(l):
+                    sign = "~" if op == "replace" and k < i2 - i1 else "+"
+                    out.append(f"[{min(first_seen.get(norm(l), t), t):7.2f}] {sign} {l}")
+        on_screen = {norm(l) for l in cur}
+        for key in [k for k in first_seen if k not in on_screen]:
+            del first_seen[key]
+        prev, last_emit, dirty = cur, t, False
+
+    def mark(t: float, what: str, arg: str) -> None:
+        nonlocal cmd_t
+        if what == "cmd":
+            text = base64.b64decode(arg).decode(errors="replace").strip()
+            if text.startswith("#"):
+                out.append(f"[{t:7.2f}] ▸ caption: {text.lstrip('#').strip()}")
+            else:
+                out.append(f"[{t:7.2f}] ▸ command: {text}")
+                cmd_t = t
+        elif what == "prompt" and cmd_t is not None:
+            emit(t)
+            out.append(f"[{t:7.2f}] {'✓' if arg == '0' else '✗'} exit {arg} after {t - cmd_t:.1f}s")
+            cmd_t = None
+
+    for i, (t, kind, data) in enumerate(events):
+        if kind != "o":
+            continue
+        if t < a.start or (a.end is not None and t > a.end):
+            stream.feed(MARK.sub("", data))
+            screen.dirty.clear()
+            prev = lines()
+            continue
+        pos = 0
+        for m in MARK.finditer(data):
+            stream.feed(data[pos:m.start()])
+            track(t)
+            pos = m.end()
+            if m.group(1) == "cmd" and dirty:
+                emit(t)
+            mark(t, m.group(1), m.group(2))
+        stream.feed(data[pos:])
+        track(t)
+        dirty = True
+        nxt = events[i + 1][0] if i + 1 < len(events) else t + 1e9
+        if nxt - t >= a.settle or t - last_emit >= a.max_gap:
+            emit(t)
+    if dirty:
+        emit(events[-1][0])
+    # Lines carry the time they first appeared, so order the body by it (stable for ties).
+    out[body_from:] = sorted(out[body_from:], key=lambda l: float(l[1:8]))
+    path = Path(a.out) if a.out else d / "readout.txt"
+    path.write_text("\n".join(out) + "\n")
+    print(f"wrote {path} ({len(out)} lines)")
+
+
+# ── voice: narration.json → one WAV per line via VoiceStudio ────────────────────────────────────────
+
+REF_SENTENCE = ("This is the narrator for this video. The voice stays calm, clear and steady from the "
+                "first line to the last.")
+
+
+def multipart(fields: dict[str, str], files: dict[str, Path]) -> tuple[bytes, str]:
+    boundary = uuid.uuid4().hex
+    body = bytearray()
+    for k, v in fields.items():
+        body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode()
+    for k, p in files.items():
+        body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"; filename=\"{p.name}\"\r\n"
+                 f"Content-Type: audio/wav\r\n\r\n").encode() + p.read_bytes() + b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+    return bytes(body), f"multipart/form-data; boundary={boundary}"
+
+
+def vs_generate(url: str, out: Path, fields: dict[str, str], ref: Path | None) -> None:
+    body, ctype = multipart({k: v for k, v in fields.items() if v not in (None, "")},
+                            {"ref_audio": ref} if ref else {})
+    req = urllib.request.Request(f"{url}/generate", data=body, headers={"Content-Type": ctype})
+    try:
+        with urllib.request.urlopen(req, timeout=1200) as r:
+            out.write_bytes(r.read())
+    except urllib.error.HTTPError as e:
+        die(f"VoiceStudio /generate {e.code}: {e.read().decode(errors='replace')[:400]}")
+
+
+def wav_duration(p: Path) -> float:
+    with wave.open(str(p)) as w:
+        return w.getnframes() / w.getframerate()
+
+
+# The backend is left as it was found: one already running (the desktop app, or one the user
+# started) is used and never stopped; one tvid starts is stopped when `voice` finishes, unless
+# --keep-backend, which records it in DIR/.tvid/voicestudio.json for `tvid voice-stop`.
+
+
+def vs_health(url: str) -> dict | None:
+    try:
+        with urllib.request.urlopen(f"{url}/health", timeout=5) as r:
+            return json.loads(r.read())
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def vs_owned(d: Path) -> dict | None:
+    """The backend tvid started for DIR and kept, if that process is still alive."""
+    f = d / ".tvid" / "voicestudio.json"
+    if not f.exists():
+        return None
+    info = json.loads(f.read_text())
+    try:
+        os.kill(info["pid"], 0)
+    except OSError:
+        f.unlink()
+        return None
+    return info
+
+
+def vs_start(a, d: Path, url: str) -> int:
+    from urllib.parse import urlparse
+
+    u = urlparse(url)
+    repo = Path(a.voicestudio_dir).expanduser()
+    if u.hostname not in ("localhost", "127.0.0.1") or not (repo / "backend").is_dir():
+        die(f"VoiceStudio is not answering at {url}, and tvid can only start a local backend from a "
+            f"VoiceStudio checkout (looked in {repo}; set --voicestudio-dir or VOICESTUDIO_DIR)")
+    log = d / ".tvid" / "voicestudio.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    print(f"starting VoiceStudio from {repo} (log: {log})")
+    proc = subprocess.Popen(
+        ["uv", "run", "--no-sync", "uvicorn", "main:app", "--app-dir", "backend",
+         "--host", "127.0.0.1", "--port", str(u.port or 80)],
+        cwd=repo, stdout=log.open("w"), stderr=subprocess.STDOUT, start_new_session=True)
+    end = time.time() + 300
+    while time.time() < end:
+        if vs_health(url):
+            return proc.pid
+        if proc.poll() is not None:
+            die(f"VoiceStudio exited during startup (code {proc.returncode}); see {log}")
+        pause(1)
+    vs_stop(proc.pid)
+    die(f"VoiceStudio did not answer within 5 minutes; see {log}")
+
+
+def vs_stop(pid: int) -> None:
+    import signal
+
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except OSError:
+        return
+    end = time.time() + 20
+    while time.time() < end:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return
+        pause(0.5)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def voice_stop(a) -> None:
+    d = Path(a.dir).resolve()
+    info = vs_owned(d)
+    if not info:
+        print("no VoiceStudio backend started by tvid for this DIR is running; nothing stopped")
+        return
+    vs_stop(info["pid"])
+    (d / ".tvid" / "voicestudio.json").unlink(missing_ok=True)
+    print(f"stopped the VoiceStudio backend tvid started (pid {info['pid']})")
+
+
+def voice(a) -> None:
+    d = Path(a.dir).resolve()
+    url = a.url.rstrip("/")
+    owned = vs_owned(d)
+    pid = owned["pid"] if owned else None
+    ready = False
+
+    def ensure() -> None:
+        """Brings the backend up on the first clip that needs generating."""
+        nonlocal pid, ready
+        if ready:
+            return
+        health = vs_health(url)
+        if health is None:
+            pid = vs_start(a, d, url)
+            health = vs_health(url)
+        elif pid is None:
+            print("using the VoiceStudio that was already running; it stays running")
+        print(f"VoiceStudio {health.get('version')} on {health.get('device')}")
+        ready = True
+
+    try:
+        generate_clips(a, d, url, ensure)
+    finally:
+        if pid is not None:
+            if a.keep_backend:
+                (d / ".tvid" / "voicestudio.json").write_text(json.dumps({"pid": pid, "url": url}))
+                print(f"VoiceStudio left running (pid {pid}); stop it with: tvid voice-stop {d}")
+            else:
+                vs_stop(pid)
+                (d / ".tvid" / "voicestudio.json").unlink(missing_ok=True)
+                print("stopped the VoiceStudio backend tvid started")
+
+
+def generate_clips(a, d: Path, url: str, ensure) -> None:
+    narration = json.loads((Path(a.narration) if a.narration else d / "narration.json").read_text())
+    vdir = d / "voice"
+    vdir.mkdir(exist_ok=True)
+
+    # Every line is cloned from one reference clip, so the whole narration is one consistent voice.
+    # A designed voice gets its reference generated once and kept in voice/, so redoing a line later
+    # still matches the rest.
+    if a.ref:
+        ref, ref_text = Path(a.ref).resolve(), a.ref_text
+    else:
+        ref, ref_text = vdir / "voice-ref.wav", REF_SENTENCE
+        key = json.dumps([a.instruct, a.seed, a.language, a.engine])
+        keyfile = vdir / "voice-ref.key"
+        if not ref.exists() or not keyfile.exists() or keyfile.read_text() != key:
+            ensure()
+            print(f"designing the voice: {a.instruct!r}, seed {a.seed} (first call may load the model)")
+            vs_generate(url, ref, {"text": REF_SENTENCE, "instruct": a.instruct, "seed": str(a.seed),
+                                   "language": a.language, "engine": a.engine}, None)
+            keyfile.write_text(key)
+
+    index_path = vdir / "clips.json"
+    old = {c["id"]: c for c in json.loads(index_path.read_text())} if index_path.exists() else {}
+    ref_hash = hashlib.sha1(ref.read_bytes()).hexdigest()[:10]
+    clips = []
+    for line in narration["lines"]:
+        lid, text = str(line["id"]), line["text"].strip()
+        wav = vdir / f"{lid}.wav"
+        h = hashlib.sha1(f"{text}|{ref_hash}|{a.speed}".encode()).hexdigest()[:10]
+        if not (wav.exists() and old.get(lid, {}).get("hash") == h):
+            ensure()
+            t0 = time.time()
+            vs_generate(url, wav, {"text": text, "ref_text": ref_text, "seed": str(a.seed),
+                                   "language": a.language, "engine": a.engine, "speed": str(a.speed)}, ref)
+            print(f"  {lid}: {time.time() - t0:.1f}s")
+        dur = wav_duration(wav)
+        words = len(text.split())
+        spw = dur / max(words, 1)
+        clips.append({"id": lid, "file": wav.name, "duration": round(dur, 3), "words": words,
+                      "sec_per_word": round(spw, 3), "hash": h,
+                      "check": None if 0.22 <= spw <= 0.7 else "pace looks wrong: listen for cut-off or garbled audio"})
+    index_path.write_text(json.dumps(clips, indent=2))
+    print(f"\n{'id':>4}  {'dur':>6}  {'words':>5}  s/word")
+    for c in clips:
+        print(f"{c['id']:>4}  {c['duration']:6.2f}  {c['words']:5d}  {c['sec_per_word']:.2f}"
+              f"{'  ← ' + c['check'] if c['check'] else ''}")
+    print(f"\nwrote {index_path}")
+
+
+# ── assemble: lay the clips over the video, fast-forward long silent stretches ─────────────────────
+
+
+def plan(lines, durs, video_len, a):
+    """Returns (segments, placements). A segment is ('play', a, b, speed) or ('freeze', t, length) in
+    source time; a placement says which segment a line starts in and its offset into that segment."""
+    segs, places, cursor = [], [], 0.0
+
+    def gap(a0: float, b0: float) -> None:
+        if b0 - a0 <= 1e-3:
+            return
+        m = a.ff_margin
+        if a.ff_speed > 1 and b0 - a0 > a.ff_gap and b0 - a0 > 2 * m + 0.5:
+            segs.extend([("play", a0, a0 + m, 1.0), ("play", a0 + m, b0 - m, a.ff_speed),
+                         ("play", b0 - m, b0, 1.0)])
+        else:
+            segs.append(("play", a0, b0, 1.0))
+
+    for i, line in enumerate(lines):
+        at, d = float(line["at"]), durs[i]
+        start = max(at, cursor + (a.min_gap if i else 0.0))
+        nxt = float(lines[i + 1]["at"]) if i + 1 < len(lines) else None
+        gap(cursor, min(start, video_len))
+        if start >= video_len:  # pushed past the end: hold the last frame
+            places.append((len(segs), 0.0))
+            segs.append(("freeze", video_len, d))
+            cursor = video_len
+            continue
+        places.append((len(segs), 0.0))
+        end = start + d
+        if a.overrun == "freeze" and nxt is not None and end > nxt:
+            segs.append(("play", start, nxt, 1.0))
+            segs.append(("freeze", nxt, end - nxt))
+            cursor = nxt
+        elif end > video_len:
+            segs.append(("play", start, video_len, 1.0))
+            segs.append(("freeze", video_len, end - video_len))
+            cursor = video_len
+        else:
+            segs.append(("play", start, end, 1.0))
+            cursor = end
+    gap(cursor, video_len)
+    segs.append(("freeze", video_len, a.tail))
+    return segs, places
+
+
+def assemble(a) -> None:
+    need("ffmpeg", "ffprobe")
+    d = Path(a.dir).resolve()
+    video = Path(a.video) if a.video else d / "recording.mp4"
+    narration = json.loads((Path(a.narration) if a.narration else d / "narration.json").read_text())
+    clips = {c["id"]: c for c in json.loads((d / "voice" / "clips.json").read_text())}
+    lines = sorted(narration["lines"], key=lambda l: float(l["at"]))
+    missing = [l["id"] for l in lines if str(l["id"]) not in clips]
+    if missing:
+        die(f"no clip for lines {missing}; run tvid voice first")
+    durs = [clips[str(l["id"])]["duration"] for l in lines]
+    vlen, fps = probe_duration(video), round(probe_fps(video))
+    vlen -= 1.0 / fps  # the last frame starts one frame before the end
+    segs, places = plan(lines, durs, vlen, a)
+
+    fdir = d / "final"
+    work = fdir / ".segments"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    enc = ["-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+           "-r", str(fps), "-video_track_timescale", "90000"]
+    seg_files, seg_lens = [], []
+    for k, s in enumerate(segs):
+        f = work / f"{k:03d}.mp4"
+        if s[0] == "play":
+            _, s0, s1, speed = s
+            if s1 - s0 < 1.0 / fps:
+                continue
+            run(["ffmpeg", "-y", "-v", "error", "-ss", f"{s0:.3f}", "-t", f"{s1 - s0:.3f}", "-i", str(video),
+                 "-vf", f"setpts=(PTS-STARTPTS)/{speed},fps={fps}", *enc, str(f)])
+        else:
+            _, t, length = s
+            png = work / f"{k:03d}.png"
+            run(["ffmpeg", "-y", "-v", "error", "-ss", f"{max(t - 1.0 / fps, 0):.3f}", "-i", str(video),
+                 "-frames:v", "1", str(png)])
+            run(["ffmpeg", "-y", "-v", "error", "-loop", "1", "-framerate", str(fps), "-t", f"{length:.3f}",
+                 "-i", str(png), *enc, str(f)])
+        seg_files.append((k, f))
+        seg_lens.append(probe_duration(f))
+    out_start = {}
+    acc = 0.0
+    for (k, _), length in zip(seg_files, seg_lens):
+        out_start[k] = acc
+        acc += length
+    total = acc
+    (work / "list.txt").write_text("".join(f"file '{f}'\n" for _, f in seg_files))
+    silent = work / "video.mp4"
+    run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(work / "list.txt"),
+         "-c", "copy", str(silent)])
+
+    def seg_out(k: int) -> float:
+        while k not in out_start:  # a skipped zero-length segment: use the next one
+            k += 1
+        return out_start[k]
+
+    starts = [seg_out(k) + off for k, off in places]
+    track = fdir / "narration.wav"
+    inputs, filters = [], []
+    for i, line in enumerate(lines):
+        inputs += ["-i", str(d / "voice" / clips[str(line["id"])]["file"])]
+        filters.append(f"[{i}:a]aresample=48000,aformat=channel_layouts=mono,"
+                       f"adelay={int(starts[i] * 1000)}:all=1[a{i}]")
+    mix = "".join(f"[a{i}]" for i in range(len(lines)))
+    filters.append(f"{mix}amix=inputs={len(lines)}:normalize=0:duration=longest,apad,atrim=0:{total:.3f}[out]")
+    run(["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", ";".join(filters), "-map", "[out]",
+         "-c:a", "pcm_s16le", str(track)])
+    final = fdir / (a.name or "narrated.mp4")
+    run(["ffmpeg", "-y", "-v", "error", "-i", str(silent), "-i", str(track), "-map", "0:v", "-map", "1:a",
+         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(final)])
+
+    srt = []
+    for i, line in enumerate(lines):
+        srt.append(f"{i + 1}\n{srt_t(starts[i])} --> {srt_t(starts[i] + durs[i])}\n{line['text'].strip()}\n")
+    (fdir / "narration.srt").write_text("\n".join(srt))
+
+    report = {"video": str(final), "source_length": round(vlen, 2), "final_length": round(total, 2),
+              "fast_forward": [], "spills": [], "freezes": [], "lines": []}
+    for s in segs:
+        if s[0] == "play" and s[3] > 1:
+            report["fast_forward"].append({"source": [round(s[1], 2), round(s[2], 2)], "speed": s[3],
+                                           "becomes": round((s[2] - s[1]) / s[3], 2)})
+        if s[0] == "freeze":
+            report["freezes"].append({"source_t": round(s[1], 2), "length": round(s[2], 2)})
+    for i, line in enumerate(lines):
+        kind, *rest = segs[places[i][0]]
+        src = rest[0]
+        late = src - float(line["at"])
+        if late > a.min_gap + 0.05:  # pushed back by more than the normal pause between lines
+            report["spills"].append({"id": line["id"], "anchor": float(line["at"]), "starts": round(src, 2),
+                                     "late_by": round(late, 2)})
+        report["lines"].append({"id": line["id"], "anchor_source": float(line["at"]), "source_start": round(src, 2),
+                                "output_start": round(starts[i], 2), "duration": durs[i]})
+    (fdir / "report.json").write_text(json.dumps(report, indent=2))
+    shutil.rmtree(work)
+
+    print(f"wrote {final}  ({fmt_t(vlen)} source → {fmt_t(total)} final)")
+    print(f"      {track}\n      {fdir / 'narration.srt'}\n      {fdir / 'report.json'}")
+    for f in report["fast_forward"]:
+        print(f"  fast-forward {fmt_t(f['source'][0])}–{fmt_t(f['source'][1])} at {f['speed']:g}x → {f['becomes']:.1f}s")
+    for s in report["spills"]:
+        print(f"  line {s['id']} starts {s['late_by']:.1f}s after its anchor {fmt_t(s['anchor'])} (previous line ran long)")
+    for f in report["freezes"][:-1]:
+        print(f"  frame held at {fmt_t(f['source_t'])} for {f['length']:.1f}s")
+
+
+def srt_t(t: float) -> str:
+    ms = int(round(t * 1000))
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+# ── cli ────────────────────────────────────────────────────────────────────────────────────────────
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="tvid", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    r = sub.add_parser("rec", help="drive a recorded shell in tmux").add_subparsers(dest="rec", required=True)
+    x = r.add_parser("start", help="open a recorded zsh in a detached tmux session")
+    x.add_argument("dir"); x.add_argument("--cols", type=int, default=140); x.add_argument("--rows", type=int, default=45)
+    x.add_argument("--cwd", help="directory the shell starts in (default: current)")
+    x.add_argument("--name", help="tmux session name (default: tvid-<dir name>)")
+    x.add_argument("--no-user-rc", action="store_true", help="skip ~/.zshenv, ~/.zprofile, ~/.zshrc")
+    x.set_defaults(fn=rec_start)
+    x = r.add_parser("run", help="type a command (after an optional caption) and wait for the prompt")
+    x.add_argument("dir"); x.add_argument("command")
+    x.add_argument("--caption", help="typed first as a '# comment' line, so the video explains itself")
+    x.add_argument("--caption-pause", type=float, default=1.0)
+    x.add_argument("--type-delay", type=float, default=0.03, help="seconds per typed character (0 = paste)")
+    x.add_argument("--timeout", type=float, default=540, help="seconds to wait for the prompt")
+    x.add_argument("--no-wait", action="store_true", help="return once the command is typed")
+    x.set_defaults(fn=rec_run)
+    x = r.add_parser("wait", help="wait for the running command to finish")
+    x.add_argument("dir"); x.add_argument("--timeout", type=float, default=540); x.set_defaults(fn=rec_wait)
+    x = r.add_parser("send", help="type text into a running program (answer a prompt)")
+    x.add_argument("dir"); x.add_argument("text"); x.add_argument("--enter", action="store_true")
+    x.add_argument("--type-delay", type=float, default=0.05); x.set_defaults(fn=rec_send)
+    x = r.add_parser("key", help="send tmux key names, e.g. C-c Enter Up")
+    x.add_argument("dir"); x.add_argument("keys", nargs="+"); x.set_defaults(fn=rec_key)
+    x = r.add_parser("screen", help="print what the pane shows now"); x.add_argument("dir"); x.set_defaults(fn=rec_screen)
+    x = r.add_parser("clear", help="clear the screen between takes"); x.add_argument("dir"); x.set_defaults(fn=rec_clear)
+    x = r.add_parser("pause", help="hold the current screen for N seconds")
+    x.add_argument("seconds", type=float); x.set_defaults(fn=rec_pause)
+    x = r.add_parser("stop", help="end the shell and save the cast"); x.add_argument("dir"); x.set_defaults(fn=rec_stop)
+
+    x = sub.add_parser("render", help="render the cast to MP4 at real speed")
+    x.add_argument("dir"); x.add_argument("--cast"); x.add_argument("--out")
+    x.add_argument("--font-size", type=int, default=16); x.add_argument("--fps", type=int, default=30)
+    x.add_argument("--theme", default="asciinema"); x.set_defaults(fn=render)
+
+    x = sub.add_parser("readout", help="write what the screen showed and when to DIR/readout.txt")
+    x.add_argument("dir"); x.add_argument("--cast", help="read this cast instead of DIR/recording.cast"); x.add_argument("--out")
+    x.add_argument("--at", type=float, help="print the full screen at this second instead")
+    x.add_argument("--start", type=float, default=0.0); x.add_argument("--end", type=float)
+    x.add_argument("--settle", type=float, default=0.5, help="quiet seconds that mark a settled screen")
+    x.add_argument("--max-gap", type=float, default=3.0, help="snapshot at least this often while output flows")
+    x.set_defaults(fn=readout)
+
+    x = sub.add_parser("voice", help="generate one WAV per narration line with VoiceStudio")
+    x.add_argument("dir"); x.add_argument("--narration")
+    x.add_argument("--url", default=os.environ.get("VOICESTUDIO_URL", "http://localhost:3900"))
+    x.add_argument("--instruct", default="male, middle-aged, moderate pitch, american accent")
+    x.add_argument("--seed", type=int, default=42)
+    x.add_argument("--ref", help="clone this WAV instead of designing a voice")
+    x.add_argument("--ref-text", help="exact words spoken in --ref")
+    x.add_argument("--language", default="English"); x.add_argument("--engine")
+    x.add_argument("--speed", type=float, default=1.0)
+    x.add_argument("--voicestudio-dir", default=os.environ.get("VOICESTUDIO_DIR", "~/dev/oss/VoiceStudio"),
+                   help="checkout to start the backend from when none is running")
+    x.add_argument("--keep-backend", action="store_true",
+                   help="leave a backend tvid started running (stop later with tvid voice-stop)")
+    x.set_defaults(fn=voice)
+    x = sub.add_parser("voice-stop", help="stop the VoiceStudio backend tvid started and kept for DIR")
+    x.add_argument("dir"); x.set_defaults(fn=voice_stop)
+
+    x = sub.add_parser("assemble", help="place the clips on the video and write DIR/final/")
+    x.add_argument("dir"); x.add_argument("--video"); x.add_argument("--narration"); x.add_argument("--name")
+    x.add_argument("--ff-gap", type=float, default=10.0, help="fast-forward unnarrated stretches longer than this")
+    x.add_argument("--ff-speed", type=float, default=2.0, help="1 disables fast-forward")
+    x.add_argument("--ff-margin", type=float, default=1.0, help="real-speed seconds kept at each end of a stretch")
+    x.add_argument("--overrun", choices=["spill", "freeze"], default="spill",
+                   help="a line longer than its slot pushes the next line later, or holds the frame")
+    x.add_argument("--min-gap", type=float, default=0.3, help="silence between consecutive lines")
+    x.add_argument("--tail", type=float, default=1.5, help="seconds to hold the last frame")
+    x.set_defaults(fn=assemble)
+
+    a = p.parse_args()
+    if a.cmd == "voice" and a.ref and not a.ref_text:
+        die("--ref needs --ref-text with the exact words spoken in the clip")
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
