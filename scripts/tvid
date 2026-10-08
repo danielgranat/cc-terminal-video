@@ -941,6 +941,56 @@ def assemble(a) -> None:
 
 # ── bundle: everything another tool needs to build from this run ────────────────────────────────────
 
+# The default direction for a film built from the bundle. A tool with an intake (anidoodle asks what,
+# style, shape, length and sound) takes these as the answers, so only `ask_user` is left to ask.
+# DIR/brief.json, or --brief, overrides any key; nested objects merge one level deep.
+BRIEF = {
+    "what": "a narrated explainer of the terminal run: one chapter per narration line, in order",
+    "shape": {"aspect": "16:9", "width": 1920, "height": 1080, "fps": 30},
+    "length": "set by the narration: each chapter lasts at least as long as its clip",
+    "look": {
+        "register": "clean",
+        "anidoodle_preset": "clean",
+        "background": "quiet and light",
+        "accent": "one accent colour: the brand colour if given, otherwise the tool's default",
+        "type": "a sans-serif for words and a monospace for the terminal, both shipped with the tool "
+                "so the film renders the same on any machine",
+    },
+    "brand": {"colors": None, "logo": None, "wordmark": None},
+    "layout": {
+        "top": "a stage strip built from the run's own steps (read them from the readout), each stage "
+               "lit while it runs",
+        "left": "the terminal",
+        "right": "the result card",
+        "under": "the chapter label, e.g. '03 / 11 Export'",
+        "bottom": "captions, in their own band",
+    },
+    "terminal": "replay the real terminal from recording.cast as proof; push in on the key lines; lift "
+                "them out as chips into the result card, where numbers become bars and counters",
+    "timing": "fit the picture to the voice: speed through waits so each result appears as it is "
+              "spoken, real speed otherwise; a slow camera drift (about 7% over a chapter) keeps it "
+              "moving; quiet stretches only under narration",
+    "sound": {
+        "voice": "the bundle's clips, each starting at its line's anchor",
+        "music": "none",
+        "captions": "each line's text, cut at the clip's natural pauses",
+    },
+    "privacy": "build only from this bundle; it is the copy with any redaction applied",
+    "ask_user": ["brand colours, logo and wordmark (fall back to the neutral clean look)"],
+}
+
+
+def brief(d: Path, override: str | None) -> dict:
+    out = json.loads(json.dumps(BRIEF))
+    path = Path(override) if override else d / "brief.json"
+    if path.exists():
+        for k, v in json.loads(path.read_text()).items():
+            out[k] = {**out[k], **v} if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    elif override:
+        die(f"no brief at {path}")
+    return out
+
+
 
 def bundle(a) -> None:
     need("ffmpeg")
@@ -997,6 +1047,7 @@ def bundle(a) -> None:
                       "cols": header["width"], "rows": header["height"], "duration": round(length, 3)},
         "audio": {"clips_lufs_target": a.lufs, "gain_db": round(gain, 2)} if voiced else None,
         "redacted": [{"rule": n, "replaced": c} for n, c in (counts.items() if rules else [])],
+        "brief": brief(d, a.brief),
         "lines": entries,
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
@@ -1103,6 +1154,7 @@ def main() -> None:
     x.add_argument("dir"); x.add_argument("--out", help="bundle folder (default DIR/showcase)")
     redaction_flags(x)
     x.add_argument("--lufs", type=float, default=-16.0, help="one gain for all clips to reach this loudness")
+    x.add_argument("--brief", help="JSON overriding the default film brief (default: DIR/brief.json if present)")
     x.add_argument("--no-normalize", dest="lufs", action="store_const", const=None)
     x.set_defaults(fn=bundle)
 

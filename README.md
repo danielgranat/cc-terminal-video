@@ -70,6 +70,8 @@ narration.md        the same lines as a table for people
 voice/              <id>.wav per line, voice-ref.wav, clips.json (durations, pace check)
 final/              narrated.mp4, narration.wav, narration.srt, report.json
 showcase/           hand-off bundle for other tools (optional, see below)
+brief.json          optional overrides for the film brief
+film/               the other tool's project, e.g. anidoodle's
 ```
 
 ## The `tvid` CLI
@@ -125,6 +127,15 @@ Every time in the manifest is in recording seconds, the same clock as the cast a
 - `speech_end`: `anchor` + clip `duration`.
 
 Another tool can either fit the picture to the voice (speed through waits so a result appears as it's spoken) or fit the voice to the picture, as `tvid assemble` does.
+
+`manifest.json` also carries a `brief`: the default direction for a film built from the bundle. It describes:
+- a narrated explainer, one chapter per line, at 16:9, 1920×1080 and 30 fps;
+- the clean look: a quiet light background and one accent colour;
+- the real terminal replayed as proof, with key lines lifted into result cards;
+- the picture fitted to the voice;
+- the user's clips as the soundtrack, with captions and no music.
+
+A tool with an intake, such as anidoodle, takes it as the answers, so only the brief's `ask_user` items (brand colours and logo) are left to ask. To change the direction for one video, put the keys you want to change in `DIR/brief.json`, for example `{"sound": {"music": "quiet bed"}}`, and bundle again. The film's project goes in `DIR/film/`, next to the bundle.
 
 The bundle takes the same redaction flags as `tvid redact` and applies them to its own copies only. The cast, video, readout and line text are all masked, so a tool that embeds the cast as data doesn't carry the private values along.
 
