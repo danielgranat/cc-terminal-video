@@ -33,16 +33,21 @@ The plugin doesn't run your demo for you. The agent in your session knows the do
 
 ## Install
 
-Requirements: macOS with zsh, plus `brew install tmux asciinema agg ffmpeg uv`. You also need a VoiceStudio checkout with its backend dependencies and model already installed.
-
-From a local clone:
+Requirements: macOS with zsh, plus `brew install tmux asciinema agg ffmpeg uv`. You also need a [VoiceStudio](https://github.com/debpalash/VoiceStudio) checkout with its backend dependencies and model already installed. `tvid` looks for it in `~/dev/oss/VoiceStudio`; set `VOICESTUDIO_DIR` if yours is elsewhere.
 
 ```
-claude plugin marketplace add ~/dev/personal/tmux-recording
+claude plugin marketplace add danielgranat/cc-terminal-video
 claude plugin install terminal-video@tmux-recording
 ```
 
-You can also run the same steps inside Claude Code with `/plugin marketplace add …` and `/plugin install …`. Start a new session afterwards to load the skills.
+You can also run the same steps inside Claude Code with `/plugin marketplace add danielgranat/cc-terminal-video` and `/plugin install terminal-video@tmux-recording`. Start a new session afterwards to load the skills.
+
+To update to the latest version:
+
+```
+claude plugin marketplace update tmux-recording
+claude plugin update terminal-video@tmux-recording
+```
 
 ## Usage
 
@@ -95,13 +100,13 @@ Run `tvid <command> --help` for every option.
 
 ## Development
 
-The installed plugin is a copy made at install time. To try edits without reinstalling, load the repo directly:
+The installed plugin is a copy made at install time. To try edits from a clone of this repo without reinstalling, load it directly:
 
 ```
-claude --plugin-dir ~/dev/personal/tmux-recording
+claude --plugin-dir <path-to-clone>
 ```
 
-To ship a change to the installed copy, bump `version` in `.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json`, then run `claude plugin update terminal-video@tmux-recording`.
+To release a change, bump `version` in `.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json` and push. Installed copies pick it up with the update commands above.
 
 ## Limitations
 
