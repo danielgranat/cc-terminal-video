@@ -1,6 +1,6 @@
 {
   "name": "terminal-video",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Record a terminal run in tmux, narrate it from what the screen showed, voice it with VoiceStudio, and assemble the narrated video.",
   "author": { "name": "Daniel Granatshtein" }
 }

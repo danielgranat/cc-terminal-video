@@ -27,6 +27,7 @@ The cast is the source of truth for the later stages: the video is rendered from
    Done with a take when its exit code and screen tail show the on-screen fact from step 1. If they don't, the take failed: stop, fix the state off camera, and record again from step 3 (a new `rec start` overwrites the cast).
 5. **Stop and render.** `tvid rec stop DIR`, then `tvid render DIR` (options: `--font-size`, `--theme`, `--fps`). Rendering keeps real time, so cast seconds and video seconds match.
 6. **Verify the video.** Run `tvid readout DIR`, then read `DIR/readout.txt`. Extract one frame per take with `ffmpeg -ss <t> -i DIR/recording.mp4 -frames:v 1 <png>` and look at it. Done when the readout shows every take's on-screen fact from step 1, and the frames show readable text with nothing wrapped or cut off.
+7. **Check for private values.** Look through the readout for anything the viewer shouldn't see: instance URLs, hostnames, account or record IDs, tokens, your home path. If you find any, list them for the user and ask whether to redact. Redaction is off unless they say yes. To redact, run `tvid redact DIR` with `--urls`, `--home` and/or `--pattern '<regex>'` (repeatable), then `tvid render DIR` and `tvid readout DIR` again, so the video and the readout both show the mask. The unredacted cast stays in `DIR/.tvid/`. Done when the user has decided, and any redaction they chose shows in a fresh readout.
 
 ## Gotchas
 

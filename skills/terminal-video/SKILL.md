@@ -32,3 +32,9 @@ DIR is one working folder per video. Default: `~/Movies/tvid/<short-slug>/`. The
 4. **Voice**, following the voice stage file.
 5. **Assemble**, following the assemble stage file, with the intake settings.
 6. **Hand over.** Report the final video's path and length, the fast-forwarded stretches and any spilled lines (from `final/report.json`), the take(s) it shows, and that nobody has listened to it yet. Done when the user has the paths and those facts in one message.
+
+## Hand-off to other tools
+
+When the user wants to build something else from the run, such as an animated explainer, slides or a teaser, run `tvid bundle DIR`. It writes `DIR/showcase/`: the cast, a video rendered from it, the readout, clips normalized to −16 LUFS with one shared gain, and `manifest.json`. The manifest gives each line's `anchor`, `slot_end` and `speech_end` in recording seconds, plus its text and clip file. The bundle takes the same `--urls`, `--home` and `--pattern` flags as `tvid redact`, and applies them to its own copies only. Point the other tool at `manifest.json`.
+
+For an animated explainer, use the anidoodle plugin. It's an optional plugin, listed in this plugin's marketplace. If its skill isn't available in the session, give the user the install command, `claude plugin install anidoodle@tmux-recording`, and tell them to start a new session; this session doesn't install it. Its first film downloads Node packages and a headless Chromium, which anidoodle's own skill sets up.

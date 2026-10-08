@@ -1,23 +1,51 @@
 {
   "name": "tmux-recording",
-  "description": "Terminal recording to narrated video: record in tmux, narrate, voice with VoiceStudio, assemble.",
+  "description": "Terminal recording to narrated video (record in tmux, narrate, voice with VoiceStudio, assemble), plus anidoodle for animated explainers.",
   "owner": {
     "name": "Daniel Granatshtein"
   },
   "metadata": {
-    "version": "0.1.1"
+    "version": "0.2.0"
   },
   "plugins": [
     {
       "name": "terminal-video",
       "source": "./",
       "description": "Record a terminal run in tmux, narrate it from what the screen showed, voice it with VoiceStudio, and assemble the narrated video.",
-      "version": "0.1.1",
+      "version": "0.2.0",
       "author": {
         "name": "Daniel Granatshtein"
       },
       "category": "productivity",
-      "keywords": ["tmux", "asciinema", "terminal", "screen-recording", "narration", "text-to-speech", "voicestudio", "video", "demo"]
+      "keywords": [
+        "tmux",
+        "asciinema",
+        "terminal",
+        "screen-recording",
+        "narration",
+        "text-to-speech",
+        "voicestudio",
+        "video",
+        "demo"
+      ]
+    },
+    {
+      "name": "anidoodle",
+      "source": {
+        "source": "github",
+        "repo": "alexgreensh/anidoodle",
+        "ref": "v0.6.4",
+        "sha": "f649db6eb823562ae41608119beb53f04d9d7c05"
+      },
+      "description": "Optional. Code-drawn films and explainers by Alex Greenshpun; builds an animated explainer from a `tvid bundle`. Listed here pinned to the release tested with terminal-video.",
+      "author": {
+        "name": "Alex Greenshpun",
+        "url": "https://github.com/alexgreensh"
+      },
+      "homepage": "https://github.com/alexgreensh/anidoodle",
+      "repository": "https://github.com/alexgreensh/anidoodle",
+      "license": "Apache-2.0",
+      "category": "design"
     }
   ]
 }

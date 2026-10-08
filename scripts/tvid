@@ -14,6 +14,7 @@ from it, so the stages hand files to each other by name:
   DIR/narration.json      the lines to speak, each anchored to a source-video time
   DIR/voice/              one WAV per line, plus clips.json with measured durations
   DIR/final/              narrated video, narration track, subtitles, report
+  DIR/showcase/           hand-off bundle for other tools: cast, readout, clips, manifest.json
 """
 
 from __future__ import annotations
@@ -79,6 +80,130 @@ def probe_fps(path: Path) -> float:
                "stream=r_frame_rate", "-of", "csv=p=0", str(path)]).stdout.strip()
     num, _, den = out.partition("/")
     return float(num) / float(den or 1)
+
+
+def loudness(path: Path) -> tuple[float, float]:
+    """Integrated loudness (LUFS) and true peak (dBTP)."""
+    err = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-af",
+                          "loudnorm=print_format=json", "-f", "null", "-"], capture_output=True, text=True).stderr
+    j = json.loads(err[err.rindex("{"):err.rindex("}") + 1])
+    return float(j["input_i"]), float(j["input_tp"])
+
+
+def loud_filter(gain_db: float) -> str:
+    """Gain, then a limiter holding peaks under -2.5 dBFS: speech peaks too high for plain gain to reach
+    the target, and the limiter only touches those peaks."""
+    return f"volume={gain_db:.2f}dB,alimiter=limit=0.75:attack=5:release=50:level=0"
+
+
+def loud_gain(src: Path, target: float) -> float:
+    """The gain for loud_filter that lands `src` on `target` LUFS (one correction for the limiter)."""
+    gain = target - loudness(src)[0]
+    with tempfile.TemporaryDirectory() as tmp:
+        probe = Path(tmp) / "probe.wav"
+        run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-af", loud_filter(gain), str(probe)])
+        return gain + (target - loudness(probe)[0])
+
+
+# Redaction rewrites what the terminal printed, so everything rendered or read from the cast shows the
+# mask. Matches are found across the whole output stream, so a value split over two writes still goes.
+
+URL = re.compile(r"[a-z][a-z0-9+.-]*://[^\s\x1b\x07'\"<>|]+", re.I)
+
+
+def redaction_rules(a) -> list[tuple[str, re.Pattern, object]]:
+    rules = []
+    if a.urls:
+        rules.append(("urls", URL, lambda m: m.group(0).split("://")[0] + "://" + "•" * 5))
+    if a.home:
+        rules.append(("home", re.compile(re.escape(str(Path.home()))), lambda m: "~"))
+    for pat in a.pattern or []:
+        rules.append((f"pattern {pat}", re.compile(pat), lambda m: "•" * len(m.group(0))))
+    return rules
+
+
+def redact_text(text: str, rules) -> str:
+    for _, rx, fn in rules:
+        text = rx.sub(fn, text)
+    return text
+
+
+def redact_stream(datas: list[str], rx: re.Pattern, fn) -> tuple[list[str], int]:
+    """Applies one rule across consecutive output chunks; a replacement lands in the chunk where its
+    match starts, and the rest of the match is dropped from the chunks it spills into."""
+    whole = "".join(datas)
+    matches = [(m.start(), m.end(), fn(m)) for m in rx.finditer(whole)]
+    if not matches:
+        return datas, 0
+    out, mi, at = [], 0, 0
+    for data in datas:
+        lo, hi = at, at + len(data)
+        piece, pos = [], lo
+        while pos < hi:
+            while mi < len(matches) and matches[mi][1] <= pos:
+                mi += 1
+            if mi < len(matches) and matches[mi][0] <= pos:
+                start, end, repl = matches[mi]
+                if pos == start:
+                    piece.append(repl)
+                pos = min(end, hi)
+            else:
+                nxt = min(matches[mi][0] if mi < len(matches) else hi, hi)
+                piece.append(whole[pos:nxt])
+                pos = nxt
+        out.append("".join(piece))
+        at = hi
+    return out, len(matches)
+
+
+def redact_cast(src: Path, dst: Path, rules) -> dict[str, int]:
+    lines = src.read_text().splitlines()
+    header = json.loads(lines[0])
+
+    def scrub(v):
+        if isinstance(v, str):
+            return redact_text(v, rules)
+        if isinstance(v, dict):
+            return {k: scrub(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [scrub(x) for x in v]
+        return v
+
+    events = [json.loads(l) for l in lines[1:] if l.strip() and not l.startswith("#")]
+    outs = [i for i, e in enumerate(events) if e[1] == "o"]
+
+    def marker(m: re.Match) -> str:  # command markers carry the command text, base64-encoded
+        if m.group(1) != "cmd":
+            return m.group(0)
+        text = redact_text(base64.b64decode(m.group(2)).decode(errors="replace"), rules)
+        return f"\x1b]7777;tvid;cmd;{base64.b64encode(text.encode()).decode()}\x07"
+
+    datas = [MARK.sub(marker, events[i][2]) for i in outs]
+    counts = {}
+    for name, rx, fn in rules:
+        datas, n = redact_stream(datas, rx, fn)
+        counts[name] = n
+    for i, data in zip(outs, datas):
+        events[i][2] = data
+    dst.write_text("\n".join([json.dumps(scrub(header))] + [json.dumps(e, ensure_ascii=False) for e in events]) + "\n")
+    return counts
+
+
+def redact(a) -> None:
+    d = Path(a.dir).resolve()
+    rules = redaction_rules(a)
+    if not rules:
+        die("nothing to redact: pass --urls, --home and/or --pattern REGEX")
+    cast = d / "recording.cast"
+    original = d / ".tvid" / "recording.original.cast"
+    original.parent.mkdir(parents=True, exist_ok=True)
+    if not original.exists():
+        shutil.copy2(cast, original)
+    counts = redact_cast(original, cast, rules)
+    for name, n in counts.items():
+        print(f"  {name}: {n} replaced")
+    print(f"redacted {cast} (unredacted copy kept at {original})\n"
+          f"next: tvid render {d} && tvid readout {d}, so the video and readout show the redaction")
 
 
 # ── rec: a zsh in tmux, recorded by asciinema, driven by the agent ──────────────────────────────────
@@ -759,8 +884,20 @@ def assemble(a) -> None:
                        f"adelay={int(starts[i] * 1000)}:all=1[a{i}]")
     mix = "".join(f"[a{i}]" for i in range(len(lines)))
     filters.append(f"{mix}amix=inputs={len(lines)}:normalize=0:duration=longest,apad,atrim=0:{total:.3f}[out]")
+    mixed = work / "mix.wav"
     run(["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", ";".join(filters), "-map", "[out]",
-         "-c:a", "pcm_s16le", str(track)])
+         "-c:a", "pcm_s16le", str(mixed)])
+    loud = None
+    if a.lufs is not None:
+        before = loudness(mixed)[0]
+        gain = loud_gain(mixed, a.lufs)
+        run(["ffmpeg", "-y", "-v", "error", "-i", str(mixed), "-af", loud_filter(gain), "-c:a", "pcm_s16le",
+             str(track)])
+        after, peak_after = loudness(track)
+        loud = {"target_lufs": a.lufs, "before_lufs": round(before, 1), "after_lufs": round(after, 1),
+                "true_peak_dbtp": round(peak_after, 1), "gain_db": round(gain, 2)}
+    else:
+        shutil.copy2(mixed, track)
     final = fdir / (a.name or "narrated.mp4")
     run(["ffmpeg", "-y", "-v", "error", "-i", str(silent), "-i", str(track), "-map", "0:v", "-map", "1:a",
          "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(final)])
@@ -771,7 +908,7 @@ def assemble(a) -> None:
     (fdir / "narration.srt").write_text("\n".join(srt))
 
     report = {"video": str(final), "source_length": round(vlen, 2), "final_length": round(total, 2),
-              "fast_forward": [], "spills": [], "freezes": [], "lines": []}
+              "loudness": loud, "fast_forward": [], "spills": [], "freezes": [], "lines": []}
     for s in segs:
         if s[0] == "play" and s[3] > 1:
             report["fast_forward"].append({"source": [round(s[1], 2), round(s[2], 2)], "speed": s[3],
@@ -792,12 +929,80 @@ def assemble(a) -> None:
 
     print(f"wrote {final}  ({fmt_t(vlen)} source → {fmt_t(total)} final)")
     print(f"      {track}\n      {fdir / 'narration.srt'}\n      {fdir / 'report.json'}")
+    if loud:
+        print(f"  loudness {loud['before_lufs']} → {loud['after_lufs']} LUFS, true peak {loud['true_peak_dbtp']} dBTP")
     for f in report["fast_forward"]:
         print(f"  fast-forward {fmt_t(f['source'][0])}–{fmt_t(f['source'][1])} at {f['speed']:g}x → {f['becomes']:.1f}s")
     for s in report["spills"]:
         print(f"  line {s['id']} starts {s['late_by']:.1f}s after its anchor {fmt_t(s['anchor'])} (previous line ran long)")
     for f in report["freezes"][:-1]:
         print(f"  frame held at {fmt_t(f['source_t'])} for {f['length']:.1f}s")
+
+
+# ── bundle: everything another tool needs to build from this run ────────────────────────────────────
+
+
+def bundle(a) -> None:
+    need("ffmpeg")
+    d = Path(a.dir).resolve()
+    out = Path(a.out).resolve() if a.out else d / "showcase"
+    shutil.rmtree(out, ignore_errors=True)
+    (out / "clips").mkdir(parents=True)
+    rules = redaction_rules(a)
+    cast = out / "recording.cast"
+    counts = redact_cast(d / "recording.cast", cast, rules) if rules else shutil.copy2(d / "recording.cast", cast)
+    # The video must come from the bundled cast, or it would still show what the cast hides.
+    if rules or not (d / "recording.mp4").exists():
+        render(argparse.Namespace(dir=str(d), cast=str(cast), out=str(out / "recording.mp4"),
+                                  fps=30, font_size=16, theme="asciinema"))
+    else:
+        shutil.copy2(d / "recording.mp4", out / "recording.mp4")
+    readout(argparse.Namespace(dir=str(d), cast=str(cast), out=str(out / "readout.txt"), at=None,
+                               start=0.0, end=None, settle=0.5, max_gap=3.0))
+    header, events = read_cast(cast)
+    length = events[-1][0] if events else 0.0
+
+    narration = json.loads((d / "narration.json").read_text())
+    lines = sorted(narration["lines"], key=lambda l: float(l["at"]))
+    clips_path = d / "voice" / "clips.json"
+    clips = {c["id"]: c for c in json.loads(clips_path.read_text())} if clips_path.exists() else {}
+    voiced = [d / "voice" / clips[str(l["id"])]["file"] for l in lines if str(l["id"]) in clips]
+    gain = 0.0
+    if voiced and a.lufs is not None:
+        joined = out / "clips" / ".all.wav"
+        listing = out / "clips" / ".list.txt"
+        listing.write_text("".join(f"file '{v}'\n" for v in voiced))
+        run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(listing), str(joined)])
+        gain = loud_gain(joined, a.lufs)
+        joined.unlink()
+        listing.unlink()
+    entries = []
+    for i, line in enumerate(lines):
+        lid = str(line["id"])
+        nxt = float(lines[i + 1]["at"]) if i + 1 < len(lines) else length
+        entry = {"id": lid, "text": redact_text(line["text"], rules), "on_screen": line.get("on_screen"),
+                 "anchor": float(line["at"]), "slot_end": round(nxt, 3)}
+        if lid in clips:
+            wav = out / "clips" / f"{lid}.wav"
+            run(["ffmpeg", "-y", "-v", "error", "-i", str(d / "voice" / clips[lid]["file"]),
+                 "-af", loud_filter(gain), "-c:a", "pcm_s16le", str(wav)])
+            dur = clips[lid]["duration"]
+            entry.update({"file": f"clips/{lid}.wav", "duration": dur,
+                          "speech_end": round(float(line["at"]) + dur, 3)})
+        entries.append(entry)
+    manifest = {
+        "format": "tvid-showcase/1",
+        "times": "seconds into the recording: cast time, which is also recording.mp4 time",
+        "recording": {"cast": "recording.cast", "video": "recording.mp4", "readout": "readout.txt",
+                      "cols": header["width"], "rows": header["height"], "duration": round(length, 3)},
+        "audio": {"clips_lufs_target": a.lufs, "gain_db": round(gain, 2)} if voiced else None,
+        "redacted": [{"rule": n, "replaced": c} for n, c in (counts.items() if rules else [])],
+        "lines": entries,
+    }
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
+    print(f"wrote {out}/: manifest.json, recording.cast, recording.mp4, readout.txt, clips/ ({len(voiced)} clips)")
+    for r in manifest["redacted"]:
+        print(f"  redacted {r['rule']}: {r['replaced']}")
 
 
 def srt_t(t: float) -> str:
@@ -882,7 +1087,24 @@ def main() -> None:
                    help="a line longer than its slot pushes the next line later, or holds the frame")
     x.add_argument("--min-gap", type=float, default=0.3, help="silence between consecutive lines")
     x.add_argument("--tail", type=float, default=1.5, help="seconds to hold the last frame")
+    x.add_argument("--lufs", type=float, default=-16.0, help="narration loudness target (true peak capped at -1.5 dBTP)")
+    x.add_argument("--no-normalize", dest="lufs", action="store_const", const=None, help="keep the clips' own loudness")
     x.set_defaults(fn=assemble)
+
+    def redaction_flags(x):
+        x.add_argument("--urls", action="store_true", help="mask URLs as scheme://•••••")
+        x.add_argument("--home", action="store_true", help="replace your home directory with ~")
+        x.add_argument("--pattern", action="append", help="mask matches of this regex (repeatable)")
+
+    x = sub.add_parser("redact", help="mask private values in DIR/recording.cast (then render and readout again)")
+    x.add_argument("dir"); redaction_flags(x); x.set_defaults(fn=redact)
+
+    x = sub.add_parser("bundle", help="write DIR/showcase/: a hand-off bundle for other tools")
+    x.add_argument("dir"); x.add_argument("--out", help="bundle folder (default DIR/showcase)")
+    redaction_flags(x)
+    x.add_argument("--lufs", type=float, default=-16.0, help="one gain for all clips to reach this loudness")
+    x.add_argument("--no-normalize", dest="lufs", action="store_const", const=None)
+    x.set_defaults(fn=bundle)
 
     a = p.parse_args()
     if a.cmd == "voice" and a.ref and not a.ref_text:
