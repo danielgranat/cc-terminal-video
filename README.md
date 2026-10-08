@@ -155,3 +155,24 @@ To release a change, bump `version` in `.claude-plugin/plugin.json` and `.claude
 - Voice comes only from VoiceStudio, at `http://localhost:3900` by default (`--url`, `VOICESTUDIO_URL`).
 - Clips are checked by pace (seconds per word), not by speech-to-text, so a mispronounced word isn't caught.
 - Redaction matches what the terminal printed. A value drawn one character at a time with cursor moves in between can slip past a regex, so check the readout after redacting.
+
+## Third-party tools
+
+This repository contains only its own code. `tvid` runs the tools below as separate programs, or imports them as libraries installed on your machine. None of them is copied into or distributed with this plugin, and each stays under its own license:
+
+| Tool | License | How it's used |
+|---|---|---|
+| [tmux](https://github.com/tmux/tmux) | ISC | runs the recorded shell |
+| [asciinema](https://github.com/asciinema/asciinema) | GPL-3.0 | records the terminal |
+| [agg](https://github.com/asciinema/agg) | GPL-3.0 | renders the recording |
+| [FFmpeg](https://ffmpeg.org) | LGPL-2.1+ / GPL, depending on the build | encodes and muxes video and audio |
+| [uv](https://github.com/astral-sh/uv) | Apache-2.0 / MIT | runs `tvid` |
+| [pyte](https://github.com/selectel/pyte) | LGPL-3.0 | terminal emulator for the readout, installed by `uv` on first run |
+| [VoiceStudio](https://github.com/debpalash/VoiceStudio) | AGPL-3.0 | generates the voice through its local HTTP API |
+| [anidoodle](https://github.com/alexgreensh/anidoodle) | Apache-2.0 | optional plugin listed in this marketplace, installed from its own repository |
+
+Generated narration audio is subject to the terms of the voice model VoiceStudio uses. Check them before you publish videos commercially.
+
+## License
+
+[MIT](LICENSE) © 2026 Daniel Granatshtein. This license covers this repository's own files only.

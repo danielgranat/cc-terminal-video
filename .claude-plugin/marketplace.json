@@ -27,7 +27,8 @@
         "voicestudio",
         "video",
         "demo"
-      ]
+      ],
+      "license": "MIT"
     },
     {
       "name": "anidoodle",
