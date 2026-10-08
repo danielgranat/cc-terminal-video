@@ -5,14 +5,14 @@
     "name": "Daniel Granatshtein"
   },
   "metadata": {
-    "version": "0.2.1"
+    "version": "0.2.2"
   },
   "plugins": [
     {
       "name": "terminal-video",
       "source": "./",
       "description": "Record a terminal run in tmux, narrate it from what the screen showed, voice it with VoiceStudio, and assemble the narrated video.",
-      "version": "0.2.1",
+      "version": "0.2.2",
       "author": {
         "name": "Daniel Granatshtein"
       },

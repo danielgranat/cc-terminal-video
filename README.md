@@ -33,7 +33,11 @@ The plugin doesn't run your demo for you. The agent in your session knows the do
 
 ## Install
 
-Requirements: macOS with zsh, plus `brew install tmux asciinema agg ffmpeg uv`. You also need a [VoiceStudio](https://github.com/debpalash/VoiceStudio) checkout with its backend dependencies and model already installed. `tvid` looks for it in `~/dev/oss/VoiceStudio`; set `VOICESTUDIO_DIR` if yours is elsewhere.
+Requirements: macOS with zsh, plus `brew install tmux asciinema agg ffmpeg uv`: tmux 3.2 or newer, asciinema 3.x. You also need [VoiceStudio](https://github.com/debpalash/VoiceStudio) with its backend dependencies and model already installed. If VoiceStudio is running, `tvid` uses it as is. For `tvid` to start the backend when needed and stop it afterwards, point it at your checkout:
+
+```
+export VOICESTUDIO_DIR=/path/to/VoiceStudio   # e.g. in ~/.zshrc
+```
 
 ```
 claude plugin marketplace add danielgranat/cc-terminal-video

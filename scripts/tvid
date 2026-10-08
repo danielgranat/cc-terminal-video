@@ -638,15 +638,21 @@ def vs_start(a, d: Path, url: str) -> int:
     from urllib.parse import urlparse
 
     u = urlparse(url)
+    if u.hostname not in ("localhost", "127.0.0.1"):
+        die(f"VoiceStudio is not answering at {url}. tvid only starts a local backend; start that one yourself")
+    if not a.voicestudio_dir:
+        die(f"VoiceStudio is not answering at {url}. Either start VoiceStudio yourself (its app, or its "
+            "backend), or tell tvid where your VoiceStudio checkout is with --voicestudio-dir PATH or "
+            "VOICESTUDIO_DIR, and it will start and stop the backend for you")
     repo = Path(a.voicestudio_dir).expanduser()
-    if u.hostname not in ("localhost", "127.0.0.1") or not (repo / "backend").is_dir():
-        die(f"VoiceStudio is not answering at {url}, and tvid can only start a local backend from a "
-            f"VoiceStudio checkout (looked in {repo}; set --voicestudio-dir or VOICESTUDIO_DIR)")
+    if not (repo / "backend").is_dir():
+        die(f"{repo} is not a VoiceStudio checkout (no backend/ folder); check --voicestudio-dir or VOICESTUDIO_DIR")
     log = d / ".tvid" / "voicestudio.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     print(f"starting VoiceStudio from {repo} (log: {log})")
     proc = subprocess.Popen(
-        ["uv", "run", "--no-sync", "uvicorn", "main:app", "--app-dir", "backend",
+        # The same command VoiceStudio's own launcher (scripts/dev-backend.mjs) runs.
+        ["uv", "run", "uvicorn", "main:app", "--app-dir", "backend",
          "--host", "127.0.0.1", "--port", str(u.port or 80)],
         cwd=repo, stdout=log.open("w"), stderr=subprocess.STDOUT, start_new_session=True)
     end = time.time() + 300
@@ -736,13 +742,17 @@ def generate_clips(a, d: Path, url: str, ensure) -> None:
     if a.ref:
         ref, ref_text = Path(a.ref).resolve(), a.ref_text
     else:
-        ref, ref_text = vdir / "voice-ref.wav", REF_SENTENCE
-        key = json.dumps([a.instruct, a.seed, a.language, a.engine])
+        sentence = a.ref_sentence or REF_SENTENCE
+        if not a.ref_sentence and a.language.lower() not in ("english", "en"):
+            die(f"--language {a.language} needs --ref-sentence: one or two sentences in that language "
+                "for the voice to be designed on")
+        ref, ref_text = vdir / "voice-ref.wav", sentence
+        key = json.dumps([a.instruct, a.seed, a.language, a.engine, sentence])
         keyfile = vdir / "voice-ref.key"
         if not ref.exists() or not keyfile.exists() or keyfile.read_text() != key:
             ensure()
             print(f"designing the voice: {a.instruct!r}, seed {a.seed} (first call may load the model)")
-            vs_generate(url, ref, {"text": REF_SENTENCE, "instruct": a.instruct, "seed": str(a.seed),
+            vs_generate(url, ref, {"text": sentence, "instruct": a.instruct, "seed": str(a.seed),
                                    "language": a.language, "engine": a.engine}, None)
             keyfile.write_text(key)
 
@@ -1120,9 +1130,12 @@ def main() -> None:
     x.add_argument("--ref", help="clone this WAV instead of designing a voice")
     x.add_argument("--ref-text", help="exact words spoken in --ref")
     x.add_argument("--language", default="English"); x.add_argument("--engine")
+    x.add_argument("--ref-sentence", help="what the designed voice's reference clip says; required when "
+                                          "--language is not English")
     x.add_argument("--speed", type=float, default=1.0)
-    x.add_argument("--voicestudio-dir", default=os.environ.get("VOICESTUDIO_DIR", "~/dev/oss/VoiceStudio"),
-                   help="checkout to start the backend from when none is running")
+    x.add_argument("--voicestudio-dir", default=os.environ.get("VOICESTUDIO_DIR"),
+                   help="your VoiceStudio checkout, to start the backend from when none is running "
+                        "(default: $VOICESTUDIO_DIR)")
     x.add_argument("--keep-backend", action="store_true",
                    help="leave a backend tvid started running (stop later with tvid voice-stop)")
     x.set_defaults(fn=voice)
