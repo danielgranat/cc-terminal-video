@@ -2,12 +2,12 @@
 
 A Claude Code plugin that turns a terminal run into a narrated demo video.
 
-Claude runs your commands in a recorded tmux session. Then it reads back what the screen showed and when, writes narration tied to those moments, voices it with a local [VoiceStudio](https://github.com/debpalash/VoiceStudio) backend, and assembles the final MP4. Long silent stretches are fast-forwarded.
+Claude runs your commands in a recorded tmux session. Then it reads back what the screen showed and when, writes narration tied to those moments, voices it with the local [Kokoro](https://github.com/thewh1teagle/kokoro-onnx) text-to-speech model (no setup; [VoiceStudio](https://github.com/debpalash/VoiceStudio) is optional), and assembles the final MP4. Long silent stretches are fast-forwarded.
 
 ```
 record ──► readout ──► narrate ──► voice ──► assemble
 tmux +     screen text   lines anchored   one WAV per   MP4 + narration WAV
-asciinema  with times    to readout times line (VoiceStudio)  + SRT + report
+asciinema  with times    to readout times line (Kokoro)  + SRT + report
 ```
 
 The plugin doesn't run your demo for you. The agent in your session knows the domain and decides what to run. The plugin gives it the tools, the order of work, and a definition of done for each stage.
@@ -19,7 +19,7 @@ The plugin doesn't run your demo for you. The agent in your session knows the do
 | `terminal-video` | `/terminal-video`, or by the agent when you ask for a narrated terminal video | The whole pipeline, after one round of intake questions. Also routes a single-stage request to the right stage. |
 | `record-terminal` | `/record-terminal` | Plans the takes, does setup off camera, records each take with a caption, renders to MP4 at real speed. |
 | `narrate-recording` | `/narrate-recording` | Explains what narration is for, how to read the readout, and the `narration.json` format. The session's own model writes the lines. |
-| `voice-narration` | `/voice-narration` | Generates one clip per line with VoiceStudio in one consistent voice, and flags clips whose pace looks wrong. |
+| `voice-narration` | `/voice-narration` | Generates one clip per line in one consistent voice (Kokoro, or VoiceStudio if you run it), and flags clips whose pace looks wrong. |
 | `assemble-video` | `/assemble-video` | Places the clips, fast-forwards unnarrated stretches, handles lines that overrun, and writes the outputs. |
 
 ### Intake questions (`/terminal-video`)
@@ -28,16 +28,12 @@ The plugin doesn't run your demo for you. The agent in your session knows the do
 |---|---|
 | Fast-forward speed for unnarrated stretches | 2× (1× turns it off) |
 | How long a stretch without narration must be before it's fast-forwarded | 10 s |
-| Voice | designed: `male, middle-aged, moderate pitch, american accent`, seed 42; or a WAV to clone |
+| Voice | Kokoro `am_michael` (American male); any other Kokoro voice, or VoiceStudio for a designed or cloned voice |
 | Narration source | the screen readout; optionally also a log file the program writes |
 
 ## Install
 
-Requirements: macOS with zsh, plus `brew install tmux asciinema agg ffmpeg uv`: tmux 3.2 or newer, asciinema 3.x. You also need [VoiceStudio](https://github.com/debpalash/VoiceStudio) with its backend dependencies and model already installed. If VoiceStudio is running, `tvid` uses it as is. For `tvid` to start the backend when needed and stop it afterwards, point it at your checkout:
-
-```
-export VOICESTUDIO_DIR=/path/to/VoiceStudio   # e.g. in ~/.zshrc
-```
+Requirements: macOS with zsh, plus `brew install tmux asciinema agg ffmpeg uv`: tmux 3.2 or newer, asciinema 3.x. Nothing else to set up: the first `tvid voice` downloads the Kokoro voice model (about 350 MB, once) into `~/.cache/tvid/kokoro`. To keep it elsewhere, set `TVID_KOKORO_DIR`.
 
 ```
 claude plugin marketplace add danielgranat/cc-terminal-video
@@ -89,8 +85,9 @@ tvid rec send|key|screen|wait|pause|clear DIR  answer prompts, send keys, inspec
 tvid rec stop DIR                              end the shell and save the cast
 tvid render DIR                                cast → MP4 at real speed (agg + ffmpeg)
 tvid readout DIR [--at SECONDS]                screen text over time, or the full screen at one moment
-tvid voice DIR [--instruct … --seed N | --ref WAV --ref-text …] [--keep-backend]
-tvid voice-stop DIR                            stop a backend tvid started and kept
+tvid voice DIR [--voice am_michael]           one clip per line with Kokoro (tvid voice --list-voices)
+tvid voice DIR --engine voicestudio [--instruct … | --ref WAV --ref-text …] [--keep-backend]
+tvid voice-stop DIR                            stop a VoiceStudio backend tvid started and kept
 tvid assemble DIR [--ff-speed 2 --ff-gap 10 --overrun spill|freeze] [--lufs -16 | --no-normalize]
 tvid redact DIR [--urls] [--home] [--pattern REGEX]...   mask private values in the cast (off unless run)
 tvid bundle DIR [--urls] [--home] [--pattern REGEX]...   write DIR/showcase/ for other tools
@@ -103,8 +100,12 @@ Run `tvid <command> --help` for every option.
 - **Exact timing without changing your program.** The recorded shell prints invisible markers into the recording for each command, caption and exit code. The readout replays the cast through a terminal emulator and stamps every screen line with the moment it first appeared. No guessing from video frames.
 - **The video and the narration always describe the same run,** because both come from the same `recording.cast`.
 - **Captions** are typed as `# comment` lines before each take, so the video explains itself even on mute.
-- **One voice for every line.** Every line is cloned from a single reference clip, which is designed once from the description and seed, or supplied by you. Only lines whose text changed are regenerated.
-- **The VoiceStudio backend is left as `tvid` found it.** A running backend is used and never stopped. If none is running, `tvid` starts one, generates the clips and stops it again (`--keep-backend` leaves it running).
+- **One voice for every line.** Kokoro speaks every line in the same fixed voice. With VoiceStudio, every line is cloned from one reference clip, designed once from a description or supplied by you. Either way, only lines whose text or voice changed are regenerated.
+- **No setup for the voice.** Kokoro runs locally on the CPU. Its model downloads once and is checked against pinned hashes.
+
+### VoiceStudio (optional)
+
+If you already run [VoiceStudio](https://github.com/debpalash/VoiceStudio) and want a designed or cloned voice, use `--engine voicestudio` (or set `TVID_VOICE_ENGINE=voicestudio`). `tvid` leaves its backend as it found it: a running VoiceStudio is used and never stopped. To have `tvid` start the backend when needed and stop it afterwards, point it at your checkout with `export VOICESTUDIO_DIR=/path/to/VoiceStudio`.
 - **The timeline is built from measured clip lengths,** not word-count estimates. A line that overruns either pushes the next line later (`spill`) or holds the frame (`freeze`). Stretches with no narration longer than the trigger play faster, with one second at real speed on each side.
 
 ## Hand-off to other tools
@@ -167,7 +168,7 @@ To release a change, bump `version` in `.claude-plugin/plugin.json` and `.claude
 ## Limitations
 
 - The recorded shell is zsh, and the plugin has only been tested on macOS.
-- Voice comes only from VoiceStudio, at `http://localhost:3900` by default (`--url`, `VOICESTUDIO_URL`).
+- Kokoro's voices are fixed: no cloning or voice design (use VoiceStudio for that). It speaks English best; its other languages have fewer voices.
 - Clips are checked by pace (seconds per word), not by speech-to-text, so a mispronounced word isn't caught.
 - Redaction matches what the terminal printed. A value drawn one character at a time with cursor moves in between can slip past a regex, so check the readout after redacting.
 
@@ -183,10 +184,14 @@ This repository contains only its own code. `tvid` runs the tools below as separ
 | [FFmpeg](https://ffmpeg.org) | LGPL-2.1+ / GPL, depending on the build | encodes and muxes video and audio |
 | [uv](https://github.com/astral-sh/uv) | Apache-2.0 / MIT | runs `tvid` |
 | [pyte](https://github.com/selectel/pyte) | LGPL-3.0 | terminal emulator for the readout, installed by `uv` on first run |
-| [VoiceStudio](https://github.com/debpalash/VoiceStudio) | AGPL-3.0 | generates the voice through its local HTTP API |
+| [kokoro-onnx](https://github.com/thewh1teagle/kokoro-onnx) | MIT | runs the Kokoro voice model, installed by `uv` on first `tvid voice` |
+| [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) model | Apache-2.0 | the default voice, downloaded once into your cache |
+| [ONNX Runtime](https://github.com/microsoft/onnxruntime) | MIT | runs the model, installed by `uv` |
+| [phonemizer](https://github.com/bootphon/phonemizer) and [espeak-ng](https://github.com/espeak-ng/espeak-ng) (via espeakng-loader) | GPL-3.0 | turn text into phonemes for Kokoro, installed by `uv` |
+| [VoiceStudio](https://github.com/debpalash/VoiceStudio) | AGPL-3.0 | optional voice engine, used through its local HTTP API |
 | [anidoodle](https://github.com/alexgreensh/anidoodle) | Apache-2.0 | optional plugin listed in this marketplace, installed from its own repository |
 
-Generated narration audio is subject to the terms of the voice model VoiceStudio uses. Check them before you publish videos commercially.
+Generated narration audio is subject to the terms of the voice model that made it: Kokoro-82M is Apache-2.0; with VoiceStudio, check the terms of the model it uses before you publish videos commercially.
 
 ## License
 

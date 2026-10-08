@@ -573,7 +573,7 @@ def readout(a) -> None:
     print(f"wrote {path} ({len(out)} lines)")
 
 
-# ── voice: narration.json → one WAV per line via VoiceStudio ────────────────────────────────────────
+# ── voice: narration.json → one WAV per line (Kokoro, or VoiceStudio) ──────────────────────────────
 
 REF_SENTENCE = ("This is the narrator for this video. The voice stays calm, clear and steady from the "
                 "first line to the last.")
@@ -697,8 +697,82 @@ def voice_stop(a) -> None:
     print(f"stopped the VoiceStudio backend tvid started (pid {info['pid']})")
 
 
+KOKORO = Path(__file__).resolve().parent / "kokoro_tts.py"
+# Kokoro voice names start with their language: a = American English, b = British English, and so on.
+KOKORO_LANG = {"a": "en-us", "b": "en-gb", "e": "es", "f": "fr-fr", "h": "hi", "i": "it", "j": "ja",
+               "p": "pt-br", "z": "cmn"}
+
+
 def voice(a) -> None:
+    if a.list_voices:
+        subprocess.run([str(KOKORO), "--list"], check=True)
+        return
+    if not a.dir:
+        die("voice needs DIR")
     d = Path(a.dir).resolve()
+    narration = json.loads((Path(a.narration) if a.narration else d / "narration.json").read_text())
+    vdir = d / "voice"
+    vdir.mkdir(exist_ok=True)
+    if a.engine == "kokoro":
+        voice_kokoro(a, narration, vdir)
+    else:
+        voice_voicestudio(a, d, narration, vdir)
+
+
+def write_clips(narration: dict, vdir: Path, key: str, synth) -> None:
+    """Generates the lines whose text or voice changed (`synth` gets [(id, text, wav)]), then indexes
+    every clip with its measured duration and a pace check."""
+    index_path = vdir / "clips.json"
+    old = {c["id"]: c for c in json.loads(index_path.read_text())} if index_path.exists() else {}
+    rows, pending = [], []
+    for line in narration["lines"]:
+        lid, text = str(line["id"]), line["text"].strip()
+        wav = vdir / f"{lid}.wav"
+        h = hashlib.sha1(f"{text}|{key}".encode()).hexdigest()[:10]
+        if not (wav.exists() and old.get(lid, {}).get("hash") == h):
+            pending.append((lid, text, wav))
+        rows.append((lid, text, wav, h))
+    if pending:
+        synth(pending)
+    clips = []
+    for lid, text, wav, h in rows:
+        dur = wav_duration(wav)
+        words = len(text.split())
+        spw = dur / max(words, 1)
+        clips.append({"id": lid, "file": wav.name, "duration": round(dur, 3), "words": words,
+                      "sec_per_word": round(spw, 3), "hash": h,
+                      "check": None if 0.22 <= spw <= 0.7 else "pace looks wrong: listen for cut-off or garbled audio"})
+    index_path.write_text(json.dumps(clips, indent=2))
+    print(f"\n{'id':>4}  {'dur':>6}  {'words':>5}  s/word")
+    for c in clips:
+        print(f"{c['id']:>4}  {c['duration']:6.2f}  {c['words']:5d}  {c['sec_per_word']:.2f}"
+              f"{'  ← ' + c['check'] if c['check'] else ''}")
+    print(f"\nwrote {index_path}")
+
+
+def voice_kokoro(a, narration: dict, vdir: Path) -> None:
+    """Kokoro: a small local model with fixed voices. Nothing to set up: the first run downloads the
+    model into the user's cache. One process loads it once and speaks every pending line."""
+    lang = a.lang or KOKORO_LANG.get(a.voice[:1], "en-us")
+
+    def synth(items) -> None:
+        print(f"Kokoro, voice {a.voice} ({lang})")
+        job = {"voice": a.voice, "speed": a.speed, "lang": lang,
+               "items": [{"text": text, "out": str(wav)} for _, text, wav in items]}
+        names = {str(wav): lid for lid, _, wav in items}
+        proc = subprocess.Popen([str(KOKORO)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        proc.stdin.write(json.dumps(job))
+        proc.stdin.close()
+        for out in proc.stdout:
+            r = json.loads(out)
+            print(f"  {names[r['out']]}: {r['seconds']:.1f}s")
+        if proc.wait():
+            die("Kokoro failed (see the message above)")
+
+    write_clips(narration, vdir, f"kokoro|{a.voice}|{a.speed}|{lang}", synth)
+
+
+def voice_voicestudio(a, d: Path, narration: dict, vdir: Path) -> None:
     url = a.url.rstrip("/")
     owned = vs_owned(d)
     pid = owned["pid"] if owned else None
@@ -719,7 +793,36 @@ def voice(a) -> None:
         ready = True
 
     try:
-        generate_clips(a, d, url, ensure)
+        # Every line is cloned from one reference clip, so the whole narration is one consistent
+        # voice. A designed voice gets its reference generated once and kept in voice/, so redoing a
+        # line later still matches the rest.
+        if a.ref:
+            ref, ref_text = Path(a.ref).resolve(), a.ref_text
+        else:
+            sentence = a.ref_sentence or REF_SENTENCE
+            if not a.ref_sentence and a.language.lower() not in ("english", "en"):
+                die(f"--language {a.language} needs --ref-sentence: one or two sentences in that language "
+                    "for the voice to be designed on")
+            ref, ref_text = vdir / "voice-ref.wav", sentence
+            key = json.dumps([a.instruct, a.seed, a.language, a.vs_engine, sentence])
+            keyfile = vdir / "voice-ref.key"
+            if not ref.exists() or not keyfile.exists() or keyfile.read_text() != key:
+                ensure()
+                print(f"designing the voice: {a.instruct!r}, seed {a.seed} (first call may load the model)")
+                vs_generate(url, ref, {"text": sentence, "instruct": a.instruct, "seed": str(a.seed),
+                                       "language": a.language, "engine": a.vs_engine}, None)
+                keyfile.write_text(key)
+
+        def synth(items) -> None:
+            ensure()
+            for lid, text, wav in items:
+                t0 = time.time()
+                vs_generate(url, wav, {"text": text, "ref_text": ref_text, "seed": str(a.seed),
+                                       "language": a.language, "engine": a.vs_engine, "speed": str(a.speed)}, ref)
+                print(f"  {lid}: {time.time() - t0:.1f}s")
+
+        ref_hash = hashlib.sha1(ref.read_bytes()).hexdigest()[:10]
+        write_clips(narration, vdir, f"voicestudio|{ref_hash}|{a.speed}|{a.language}|{a.vs_engine}", synth)
     finally:
         if pid is not None:
             if a.keep_backend:
@@ -729,59 +832,6 @@ def voice(a) -> None:
                 vs_stop(pid)
                 (d / ".tvid" / "voicestudio.json").unlink(missing_ok=True)
                 print("stopped the VoiceStudio backend tvid started")
-
-
-def generate_clips(a, d: Path, url: str, ensure) -> None:
-    narration = json.loads((Path(a.narration) if a.narration else d / "narration.json").read_text())
-    vdir = d / "voice"
-    vdir.mkdir(exist_ok=True)
-
-    # Every line is cloned from one reference clip, so the whole narration is one consistent voice.
-    # A designed voice gets its reference generated once and kept in voice/, so redoing a line later
-    # still matches the rest.
-    if a.ref:
-        ref, ref_text = Path(a.ref).resolve(), a.ref_text
-    else:
-        sentence = a.ref_sentence or REF_SENTENCE
-        if not a.ref_sentence and a.language.lower() not in ("english", "en"):
-            die(f"--language {a.language} needs --ref-sentence: one or two sentences in that language "
-                "for the voice to be designed on")
-        ref, ref_text = vdir / "voice-ref.wav", sentence
-        key = json.dumps([a.instruct, a.seed, a.language, a.engine, sentence])
-        keyfile = vdir / "voice-ref.key"
-        if not ref.exists() or not keyfile.exists() or keyfile.read_text() != key:
-            ensure()
-            print(f"designing the voice: {a.instruct!r}, seed {a.seed} (first call may load the model)")
-            vs_generate(url, ref, {"text": sentence, "instruct": a.instruct, "seed": str(a.seed),
-                                   "language": a.language, "engine": a.engine}, None)
-            keyfile.write_text(key)
-
-    index_path = vdir / "clips.json"
-    old = {c["id"]: c for c in json.loads(index_path.read_text())} if index_path.exists() else {}
-    ref_hash = hashlib.sha1(ref.read_bytes()).hexdigest()[:10]
-    clips = []
-    for line in narration["lines"]:
-        lid, text = str(line["id"]), line["text"].strip()
-        wav = vdir / f"{lid}.wav"
-        h = hashlib.sha1(f"{text}|{ref_hash}|{a.speed}".encode()).hexdigest()[:10]
-        if not (wav.exists() and old.get(lid, {}).get("hash") == h):
-            ensure()
-            t0 = time.time()
-            vs_generate(url, wav, {"text": text, "ref_text": ref_text, "seed": str(a.seed),
-                                   "language": a.language, "engine": a.engine, "speed": str(a.speed)}, ref)
-            print(f"  {lid}: {time.time() - t0:.1f}s")
-        dur = wav_duration(wav)
-        words = len(text.split())
-        spw = dur / max(words, 1)
-        clips.append({"id": lid, "file": wav.name, "duration": round(dur, 3), "words": words,
-                      "sec_per_word": round(spw, 3), "hash": h,
-                      "check": None if 0.22 <= spw <= 0.7 else "pace looks wrong: listen for cut-off or garbled audio"})
-    index_path.write_text(json.dumps(clips, indent=2))
-    print(f"\n{'id':>4}  {'dur':>6}  {'words':>5}  s/word")
-    for c in clips:
-        print(f"{c['id']:>4}  {c['duration']:6.2f}  {c['words']:5d}  {c['sec_per_word']:.2f}"
-              f"{'  ← ' + c['check'] if c['check'] else ''}")
-    print(f"\nwrote {index_path}")
 
 
 # ── assemble: lay the clips over the video, fast-forward long silent stretches ─────────────────────
@@ -1122,21 +1172,29 @@ def main() -> None:
     x.add_argument("--max-gap", type=float, default=3.0, help="snapshot at least this often while output flows")
     x.set_defaults(fn=readout)
 
-    x = sub.add_parser("voice", help="generate one WAV per narration line with VoiceStudio")
-    x.add_argument("dir"); x.add_argument("--narration")
-    x.add_argument("--url", default=os.environ.get("VOICESTUDIO_URL", "http://localhost:3900"))
-    x.add_argument("--instruct", default="male, middle-aged, moderate pitch, american accent")
-    x.add_argument("--seed", type=int, default=42)
-    x.add_argument("--ref", help="clone this WAV instead of designing a voice")
-    x.add_argument("--ref-text", help="exact words spoken in --ref")
-    x.add_argument("--language", default="English"); x.add_argument("--engine")
-    x.add_argument("--ref-sentence", help="what the designed voice's reference clip says; required when "
-                                          "--language is not English")
+    x = sub.add_parser("voice", help="generate one WAV per narration line (Kokoro by default)")
+    x.add_argument("dir", nargs="?"); x.add_argument("--narration")
+    x.add_argument("--engine", choices=["kokoro", "voicestudio"],
+                   default=os.environ.get("TVID_VOICE_ENGINE", "kokoro"))
     x.add_argument("--speed", type=float, default=1.0)
-    x.add_argument("--voicestudio-dir", default=os.environ.get("VOICESTUDIO_DIR"),
+    k = x.add_argument_group("kokoro")
+    k.add_argument("--voice", default="am_michael", help="Kokoro voice (see --list-voices)")
+    k.add_argument("--lang", help="Kokoro language code (default: from the voice name, e.g. am_ → en-us)")
+    k.add_argument("--list-voices", action="store_true", help="print Kokoro's voices and exit")
+    v = x.add_argument_group("voicestudio")
+    v.add_argument("--url", default=os.environ.get("VOICESTUDIO_URL", "http://localhost:3900"))
+    v.add_argument("--instruct", default="male, middle-aged, moderate pitch, american accent")
+    v.add_argument("--seed", type=int, default=42)
+    v.add_argument("--ref", help="clone this WAV instead of designing a voice")
+    v.add_argument("--ref-text", help="exact words spoken in --ref")
+    v.add_argument("--ref-sentence", help="what the designed voice's reference clip says; required when "
+                                          "--language is not English")
+    v.add_argument("--language", default="English")
+    v.add_argument("--vs-engine", help="VoiceStudio engine id (default: VoiceStudio's selected engine)")
+    v.add_argument("--voicestudio-dir", default=os.environ.get("VOICESTUDIO_DIR"),
                    help="your VoiceStudio checkout, to start the backend from when none is running "
                         "(default: $VOICESTUDIO_DIR)")
-    x.add_argument("--keep-backend", action="store_true",
+    v.add_argument("--keep-backend", action="store_true",
                    help="leave a backend tvid started running (stop later with tvid voice-stop)")
     x.set_defaults(fn=voice)
     x = sub.add_parser("voice-stop", help="stop the VoiceStudio backend tvid started and kept for DIR")

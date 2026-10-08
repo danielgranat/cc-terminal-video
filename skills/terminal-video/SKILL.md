@@ -1,6 +1,6 @@
 ---
 name: terminal-video
-description: Narrated video of a terminal run. Records the run in tmux, reads back what the screen showed, writes and voices the narration with VoiceStudio, and assembles the video with idle stretches fast-forwarded. Use when asked to record, film or demo a terminal or CLI run, to narrate a terminal recording, or to voice a narration over one; also for any single stage of that.
+description: Narrated video of a terminal run. Records the run in tmux, reads back what the screen showed, writes and voices the narration, and assembles the video with idle stretches fast-forwarded. Use when asked to record, film or demo a terminal or CLI run, to narrate a terminal recording, or to voice a narration over one; also for any single stage of that.
 ---
 
 # Terminal video
@@ -23,7 +23,7 @@ DIR is one working folder per video. Default: `~/Movies/tvid/<short-slug>/`. The
 1. **Intake.** Ask once, in a single question round, before recording anything. Ask only what the conversation hasn't already answered, and offer the default as the first option:
    - **Fast-forward**: speed for unnarrated stretches (default 2×; 1× turns it off).
    - **Trigger**: how long a stretch without narration must be before it is fast-forwarded (default 10 s).
-   - **Voice**: the designed default (`male, middle-aged, moderate pitch, american accent`, seed 42), another description, or a WAV to clone (with the words spoken in it).
+   - **Voice**: Kokoro's `am_michael` (American male, the default), another Kokoro voice (`tvid voice --list-voices`), or, if they run VoiceStudio, a designed or cloned voice.
    - **Narration source**: the screen readout (default), plus a log file the program writes, if it has one.
 
    Settle these yourself unless the user raises them: who the video is for and what they should come away with (infer it from the conversation), a line longer than its slot spills into the next slot, the final frame holds until the narration ends. Done when every setting is either answered or defaulted, and you have stated the defaults you took.

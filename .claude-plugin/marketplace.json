@@ -1,18 +1,18 @@
 {
   "name": "tmux-recording",
-  "description": "Terminal recording to narrated video (record in tmux, narrate, voice with VoiceStudio, assemble), plus anidoodle for animated explainers.",
+  "description": "Terminal recording to narrated video (record in tmux, narrate, voice locally, assemble), plus anidoodle for animated explainers.",
   "owner": {
     "name": "Daniel Granatshtein"
   },
   "metadata": {
-    "version": "0.2.2"
+    "version": "0.3.0"
   },
   "plugins": [
     {
       "name": "terminal-video",
       "source": "./",
-      "description": "Record a terminal run in tmux, narrate it from what the screen showed, voice it with VoiceStudio, and assemble the narrated video.",
-      "version": "0.2.2",
+      "description": "Record a terminal run in tmux, narrate it from what the screen showed, voice it locally (Kokoro, or VoiceStudio), and assemble the narrated video.",
+      "version": "0.3.0",
       "author": {
         "name": "Daniel Granatshtein"
       },
@@ -24,9 +24,9 @@
         "screen-recording",
         "narration",
         "text-to-speech",
-        "voicestudio",
         "video",
-        "demo"
+        "demo",
+        "kokoro"
       ],
       "license": "MIT"
     },
